@@ -549,7 +549,7 @@ app.use((err, req, res, _next) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // START SERVER
 // ═════════════════════════════════════════════════════════════════════════════
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('🌿 ══════════════════════════════════════════════════════');
   console.log('   AgroNet Africa Backend v2.0 — Production Server');
