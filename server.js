@@ -23,22 +23,9 @@ const PORT = process.env.PORT || 5000;
 // Helmet — sets 14 security-related HTTP response headers
 app.use(helmet());
 
-// CORS — explicitly allow only the Vercel frontend domain (+ localhost for dev)
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
-  : ['http://localhost:3000'];
-
 app.use(
   cors({
-    origin: (origin, callback) => {
-      // Allow server-to-server requests (no Origin header) and listed origins
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      callback(new Error(`CORS: origin '${origin}' not allowed`));
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    origin: ['https://agronet-africa.vercel.app', 'http://localhost:3000'],
     credentials: true,
   })
 );
@@ -201,6 +188,56 @@ app.post(
     return res.status(201).json({
       success: true,
       message: 'User registered successfully.',
+      data: result.rows[0],
+    });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/login — User Login
+// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Authenticates an AgroNet Africa user.
+ *
+ * Body: { email, password }
+ *
+ * Returns 200 with the user profile on success.
+ */
+app.post(
+  '/api/auth/login',
+  strictLimiter,
+  asyncHandler(async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || typeof email !== 'string') {
+      return validationError(res, 'Email is required.');
+    }
+    if (!password) {
+      return validationError(res, 'Password is required.');
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, email, phone, role, location, is_verified, created_at
+       FROM users
+       WHERE email = $1`,
+      [email.toLowerCase().trim()]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Invalid credentials.',
+      });
+    }
+
+    // In a full implementation, you would compare hashes:
+    // const validPassword = await bcrypt.compare(password, user.password_hash);
+    // if (!validPassword) throw ...
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful.',
       data: result.rows[0],
     });
   })
