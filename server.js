@@ -1,6 +1,6 @@
 // server.js — AgroNet Africa Backend v2.0
 // Production-ready Express server: security hardening, rate limiting,
-// compression, full CRUD endpoints, and graceful shutdown.
+// compression, full CRUD endpoints, authentication, and graceful shutdown.
 
 'use strict';
 
@@ -11,10 +11,14 @@ const helmet       = require('helmet');
 const compression  = require('compression');
 const cors         = require('cors');
 const rateLimit    = require('express-rate-limit');
+const bcrypt       = require('bcryptjs');
+const jwt          = require('jsonwebtoken');
 const { pool, shutdown } = require('./db');
+const { verifyToken }    = require('./middleware/auth');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECURITY MIDDLEWARE
@@ -93,14 +97,6 @@ const asyncHandler = (fn) => (req, res, next) =>
 const validationError = (res, message) =>
   res.status(400).json({ success: false, error: 'Validation Error', message });
 
-/** Build a structured DB-unavailable response */
-const dbUnavailable = (res) =>
-  res.status(503).json({
-    success: false,
-    error: 'Database Unavailable',
-    message: 'Database tables are not yet initialized. Run init.sql first.',
-  });
-
 // ═════════════════════════════════════════════════════════════════════════════
 // ROUTE: GET / — Health Check
 // ═════════════════════════════════════════════════════════════════════════════
@@ -115,7 +111,8 @@ app.get('/', (req, res) => {
     endpoints: {
       health:        'GET  /',
       register:      'POST /api/users',
-      user_profile:  'GET  /api/users/:id',
+      login:         'POST /api/auth/login',
+      profile:       'GET  /api/users/profile',
       dispatch:      'POST /api/dispatch',
       jobs:          'GET  /api/jobs?page=1&limit=20&status=active',
     },
@@ -128,16 +125,16 @@ app.get('/', (req, res) => {
 /**
  * Registers a new AgroNet Africa user.
  *
- * Body: { name, email, phone?, role?, location? }
+ * Body: { name, email, password, phone?, role?, location? }
  *   role: 'farmer' | 'agent' | 'admin'  (default: 'farmer')
  *
- * Returns 201 with the created user profile.
+ * Returns 201 with the created user profile and JWT token.
  */
 app.post(
   '/api/users',
   strictLimiter,
   asyncHandler(async (req, res) => {
-    const { name, email, phone, role = 'farmer', location } = req.body;
+    const { name, email, password, phone, role = 'farmer', location } = req.body;
 
     // ── Input Validation ──────────────────────────────────────────────────
     if (!name || typeof name !== 'string' || !name.trim()) {
@@ -148,6 +145,9 @@ app.post(
     }
     if (!isValidEmail(email)) {
       return validationError(res, 'Please provide a valid email address.');
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return validationError(res, '"password" is required and must be at least 6 characters.');
     }
 
     const VALID_ROLES = ['farmer', 'agent', 'admin'];
@@ -161,7 +161,7 @@ app.post(
     // ── Duplicate check ───────────────────────────────────────────────────
     const existing = await pool.query(
       'SELECT id FROM users WHERE email = $1',
-      [email.toLowerCase()]
+      [email.toLowerCase().trim()]
     );
     if (existing.rows.length > 0) {
       return res.status(409).json({
@@ -171,24 +171,39 @@ app.post(
       });
     }
 
+    // ── Password Hashing ──────────────────────────────────────────────────
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
     // ── Insert ────────────────────────────────────────────────────────────
     const result = await pool.query(
-      `INSERT INTO users (name, email, phone, role, location)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO users (name, email, password_hash, phone, role, location)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, name, email, phone, role, location, is_verified, created_at`,
       [
         name.trim(),
         email.toLowerCase().trim(),
+        passwordHash,
         phone  ? phone.trim()    : null,
         role,
         location ? location.trim() : null,
       ]
     );
 
+    const user = result.rows[0];
+
+    // ── Generate JWT ──────────────────────────────────────────────────────
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
     return res.status(201).json({
       success: true,
       message: 'User registered successfully.',
-      data: result.rows[0],
+      token,
+      user
     });
   })
 );
@@ -201,7 +216,7 @@ app.post(
  *
  * Body: { email, password }
  *
- * Returns 200 with the user profile on success.
+ * Returns 200 with the JWT token and user profile.
  */
 app.post(
   '/api/auth/login',
@@ -217,7 +232,7 @@ app.post(
     }
 
     const result = await pool.query(
-      `SELECT id, name, email, phone, role, location, is_verified, created_at
+      `SELECT id, name, email, password_hash, phone, role, location, is_verified, created_at
        FROM users
        WHERE email = $1`,
       [email.toLowerCase().trim()]
@@ -231,37 +246,52 @@ app.post(
       });
     }
 
-    // In a full implementation, you would compare hashes:
-    // const validPassword = await bcrypt.compare(password, user.password_hash);
-    // if (!validPassword) throw ...
+    const userRecord = result.rows[0];
+
+    // ── Verify Password ───────────────────────────────────────────────────
+    const isMatch = await bcrypt.compare(password, userRecord.password_hash);
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Invalid credentials.',
+      });
+    }
+
+    // ── Remove password hash from response payload ────────────────────────
+    const { password_hash, ...user } = userRecord;
+
+    // ── Generate JWT ──────────────────────────────────────────────────────
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
     return res.status(200).json({
       success: true,
       message: 'Login successful.',
-      data: result.rows[0],
+      token,
+      user
     });
   })
 );
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: GET /api/users/:id — Fetch User Profile (Dashboard)
+// ROUTE: GET /api/users/profile — Fetch Current Authenticated User Profile
 // ═════════════════════════════════════════════════════════════════════════════
 /**
- * Fetches a single user's profile by UUID.
+ * Fetches the currently logged-in user's profile using their JWT.
  * Powers the custom user dashboard on the frontend.
  *
- * Params: :id — UUID of the user
+ * Headers: { Authorization: 'Bearer <token>' }
  */
 app.get(
-  '/api/users/:id',
+  '/api/users/profile',
+  verifyToken,
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
-
-    // Basic UUID shape check to avoid expensive DB round-trip
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!UUID_RE.test(id)) {
-      return validationError(res, 'Invalid user ID format. Must be a valid UUID.');
-    }
+    // req.user is populated by verifyToken middleware
+    const { id } = req.user;
 
     const result = await pool.query(
       `SELECT id, name, email, phone, role, location, is_verified, created_at
@@ -274,13 +304,13 @@ app.get(
       return res.status(404).json({
         success: false,
         error: 'Not Found',
-        message: 'No user found with the provided ID.',
+        message: 'User profile not found.',
       });
     }
 
     return res.status(200).json({
       success: true,
-      data: result.rows[0],
+      user: result.rows[0],
     });
   })
 );
@@ -288,21 +318,6 @@ app.get(
 // ═════════════════════════════════════════════════════════════════════════════
 // ROUTE: POST /api/dispatch — Contextual Dispatch / Emergency Triage
 // ═════════════════════════════════════════════════════════════════════════════
-/**
- * Accepts a natural language distress string, GPS coordinates, and optional
- * farmer_id for the Core AI Innovation module. Persists to the dispatches table
- * and returns a structured triage ticket.
- *
- * Body: {
- *   farmer_id?,        — UUID of the reporting farmer (optional)
- *   distress_input,    — Free-text natural language distress description (required)
- *   latitude?,         — GPS latitude (e.g. 6.5244)
- *   longitude?,        — GPS longitude (e.g. 3.3792)
- *   ai_classification?,— AI model label (e.g. "pest_outbreak") — set by AI layer
- *   severity?,         — 'low' | 'medium' | 'high' | 'critical' (default: 'medium')
- *   escrow_status?,    — 'pending' | 'held' | 'released' | 'refunded' (default: 'pending')
- * }
- */
 app.post(
   '/api/dispatch',
   strictLimiter,
@@ -317,7 +332,6 @@ app.post(
       escrow_status    = 'pending',
     } = req.body;
 
-    // ── Input Validation ──────────────────────────────────────────────────
     if (!distress_input || typeof distress_input !== 'string' || !distress_input.trim()) {
       return validationError(
         res,
@@ -327,18 +341,12 @@ app.post(
 
     const VALID_SEVERITIES = ['low', 'medium', 'high', 'critical'];
     if (!VALID_SEVERITIES.includes(severity)) {
-      return validationError(
-        res,
-        `"severity" must be one of: ${VALID_SEVERITIES.join(', ')}.`
-      );
+      return validationError(res, `"severity" must be one of: ${VALID_SEVERITIES.join(', ')}.`);
     }
 
     const VALID_ESCROW = ['pending', 'held', 'released', 'refunded'];
     if (!VALID_ESCROW.includes(escrow_status)) {
-      return validationError(
-        res,
-        `"escrow_status" must be one of: ${VALID_ESCROW.join(', ')}.`
-      );
+      return validationError(res, `"escrow_status" must be one of: ${VALID_ESCROW.join(', ')}.`);
     }
 
     if (latitude !== null && (isNaN(latitude) || Math.abs(latitude) > 90)) {
@@ -348,7 +356,6 @@ app.post(
       return validationError(res, '"longitude" must be a number between -180 and 180.');
     }
 
-    // ── Contextual Dispatch Classification ───────────────────────────────
     const DISPATCH_TEAMS = {
       pest_outbreak: 'Agro-Pest Response Unit',
       flood:         'Water & Drainage Emergency Team',
@@ -368,7 +375,6 @@ app.post(
     const classificationKey = ai_classification?.toLowerCase().replace(/\s+/g, '_');
     const assignedTeam      = DISPATCH_TEAMS[classificationKey] || DISPATCH_TEAMS.default;
 
-    // ── Persist to DB ─────────────────────────────────────────────────────
     const result = await pool.query(
       `INSERT INTO dispatches
          (farmer_id, distress_input, latitude, longitude, ai_classification,
@@ -391,9 +397,7 @@ app.post(
 
     const record = result.rows[0];
 
-    console.log(
-      `[DISPATCH] 🚨 ${severity.toUpperCase()} | ID: ${record.id} | Team: ${assignedTeam}`
-    );
+    console.log(`[DISPATCH] 🚨 ${severity.toUpperCase()} | ID: ${record.id} | Team: ${assignedTeam}`);
 
     return res.status(201).json({
       success: true,
@@ -409,16 +413,6 @@ app.post(
 // ═════════════════════════════════════════════════════════════════════════════
 // ROUTE: GET /api/jobs — Fetch Active Jobs (Paginated)
 // ═════════════════════════════════════════════════════════════════════════════
-/**
- * Returns a paginated list of job postings.
- * Supports high-volume infinite scroll without lagging.
- *
- * Query params:
- *   page   {number} — page number, 1-based (default: 1)
- *   limit  {number} — items per page, max 100 (default: 20)
- *   status {string} — 'active' | 'filled' | 'closed' | 'draft' (default: 'active')
- *   location {string} — filter by location keyword (optional)
- */
 app.get(
   '/api/jobs',
   asyncHandler(async (req, res) => {
@@ -433,13 +427,9 @@ app.get(
 
     const VALID_STATUS = ['active', 'filled', 'closed', 'draft'];
     if (!VALID_STATUS.includes(status)) {
-      return validationError(
-        res,
-        `"status" must be one of: ${VALID_STATUS.join(', ')}.`
-      );
+      return validationError(res, `"status" must be one of: ${VALID_STATUS.join(', ')}.`);
     }
 
-    // Build dynamic query with optional location filter
     const params  = [status, limit, offset];
     let whereClause = 'WHERE j.status = $1';
 
@@ -448,15 +438,9 @@ app.get(
       whereClause += ` AND LOWER(j.location) LIKE $${params.length}`;
     }
 
-    // Fetch jobs with farmer name via JOIN, ordered newest first
     const jobsQuery = `
       SELECT
-        j.id,
-        j.title,
-        j.description,
-        j.location,
-        j.status,
-        j.created_at,
+        j.id, j.title, j.description, j.location, j.status, j.created_at,
         u.id   AS farmer_id,
         u.name AS farmer_name
       FROM jobs j
@@ -466,7 +450,6 @@ app.get(
       LIMIT $2 OFFSET $3
     `;
 
-    // Total count for pagination metadata (uses same filter, no LIMIT)
     const countParams  = [status];
     let countWhere     = 'WHERE status = $1';
     if (locationKw) {
@@ -487,10 +470,7 @@ app.get(
       success: true,
       data: jobsResult.rows,
       pagination: {
-        page,
-        limit,
-        total,
-        total_pages: totalPages,
+        page, limit, total, total_pages: totalPages,
         has_next:    page < totalPages,
         has_prev:    page > 1,
       },
@@ -511,21 +491,13 @@ app.use((req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // CENTRALIZED ERROR HANDLER
-// All errors thrown inside asyncHandler() land here.
-// The server NEVER crashes on bad input or unexpected exceptions.
 // ═════════════════════════════════════════════════════════════════════════════
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
-  // CORS errors from our whitelist
   if (err.message && err.message.startsWith('CORS:')) {
-    return res.status(403).json({
-      success: false,
-      error: 'Forbidden',
-      message: err.message,
-    });
+    return res.status(403).json({ success: false, error: 'Forbidden', message: err.message });
   }
 
-  // PostgreSQL: table not found (schema not yet initialized)
   if (err.code === '42P01') {
     return res.status(503).json({
       success: false,
@@ -534,7 +506,6 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  // PostgreSQL: unique constraint violation
   if (err.code === '23505') {
     return res.status(409).json({
       success: false,
@@ -543,7 +514,6 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  // PostgreSQL: foreign key violation
   if (err.code === '23503') {
     return res.status(422).json({
       success: false,
@@ -552,7 +522,6 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  // JSON parse error from express.json()
   if (err.type === 'entity.parse.failed') {
     return res.status(400).json({
       success: false,
@@ -561,7 +530,6 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  // Payload too large
   if (err.status === 413) {
     return res.status(413).json({
       success: false,
@@ -570,15 +538,11 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  // Default: internal server error (log full stack in development only)
   console.error('[ERROR]', err.stack || err.message);
   return res.status(500).json({
     success: false,
     error: 'Internal Server Error',
-    message:
-      process.env.NODE_ENV === 'development'
-        ? err.message
-        : 'Something went wrong. Please try again later.',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong. Please try again later.',
   });
 });
 
@@ -593,14 +557,13 @@ const server = app.listen(PORT, () => {
   console.log(`   🚀  URL:         http://localhost:${PORT}`);
   console.log(`   📦  Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`   🗄️   Database:    ${process.env.DATABASE_URL ? '✅ Configured' : '⚠️  DATABASE_URL not set'}`);
-  console.log(`   🛡️   Security:    helmet ✅  rate-limit ✅  compression ✅`);
-  console.log(`   🌐  CORS:        ${allowedOrigins.join(', ')}`);
+  console.log(`   🛡️   Security:    helmet ✅  rate-limit ✅  compression ✅  jwt ✅`);
   console.log('🌿 ══════════════════════════════════════════════════════');
   console.log('');
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// GRACEFUL SHUTDOWN — Render / Docker / PM2 send SIGTERM before stopping
+// GRACEFUL SHUTDOWN
 // ═════════════════════════════════════════════════════════════════════════════
 const gracefulShutdown = async (signal) => {
   console.log(`\n[SERVER] ${signal} received. Shutting down gracefully…`);
@@ -610,7 +573,6 @@ const gracefulShutdown = async (signal) => {
     process.exit(0);
   });
 
-  // Force exit if graceful shutdown takes > 10 s
   setTimeout(() => {
     console.error('[SERVER] Forced shutdown after 10 s timeout.');
     process.exit(1);
