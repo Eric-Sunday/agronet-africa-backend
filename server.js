@@ -27,12 +27,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
 // Helmet — sets 14 security-related HTTP response headers
 app.use(helmet());
 
-app.use(
-  cors({
-    origin: ['https://agronet-africa.vercel.app', 'http://localhost:3000'],
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: [
+    'https://agronet-africa.vercel.app', 
+    'http://localhost:5173'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+}));
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PERFORMANCE MIDDLEWARE
