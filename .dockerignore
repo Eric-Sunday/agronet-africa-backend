@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────
+# .dockerignore — AgroNet Africa Backend
+# Keeps the build context small and secure
+# ─────────────────────────────────────────────
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Environment secrets — NEVER bake into the image
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# Editor & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# SQL scripts (run separately against Cloud SQL, not bundled in the image)
+*.sql
+
+# Test & coverage
+coverage/
+.nyc_output/
+
+# Logs
+logs/
+*.log
