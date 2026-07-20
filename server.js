@@ -17,6 +17,9 @@ const { pool, shutdown } = require('./db');
 const { verifyToken }    = require('./middleware/auth');
 
 const app  = express();
+
+// Trust Render's reverse proxy for proper rate limiting IP extraction
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
 
