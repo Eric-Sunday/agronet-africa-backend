@@ -16,11 +16,25 @@ const jwt          = require('jsonwebtoken');
 const { pool, shutdown } = require('./db');
 const { verifyToken }    = require('./middleware/auth');
 
-const app  = express();
+// ── Process-level safety nets ─────────────────────────────────────────────────
+// Prevent unhandled async rejections from crashing the server process
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[PROCESS] Unhandled Promise Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[PROCESS] Uncaught Exception:', err.message);
+  // Don't exit — allow Express error handler to manage request-level errors
+});
 
-// Trust Render's reverse proxy for proper rate limiting IP extraction
+const app = express();
+
+// ── Trust Render's reverse proxy (MUST be first) ─────────────────────────────
+// Required for express-rate-limit to correctly read the real client IP
+// from the X-Forwarded-For header set by Render's load balancer.
 app.set('trust proxy', 1);
-const PORT = process.env.PORT || 5000;
+
+// Isolate all secrets strictly within process.env
+const PORT       = process.env.PORT       || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -51,11 +65,14 @@ app.use(compression({ level: 6, threshold: 1024 }));
 // ═════════════════════════════════════════════════════════════════════════════
 
 // Global limiter: 200 requests per 15 minutes per IP
+// validate.trustProxy=false suppresses the ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// warning since we already set 'trust proxy' above.
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: false },
   message: {
     success: false,
     error: 'Too Many Requests',
@@ -69,6 +86,7 @@ const strictLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: false },
   message: {
     success: false,
     error: 'Too Many Requests',
@@ -412,6 +430,42 @@ app.post(
         expected_response_time: RESPONSE_SLA[severity],
       },
     });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: GET /api/users/:id — Fetch a Single User Profile by ID
+// ═════════════════════════════════════════════════════════════════════════════
+app.get(
+  '/api/users/:id',
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    // Basic UUID format guard before hitting the DB
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'User ID must be a valid UUID.',
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, email, phone, role, location, is_verified, created_at
+       FROM users WHERE id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: 'User not found.',
+      });
+    }
+
+    return res.status(200).json({ success: true, data: result.rows[0] });
   })
 );
 
