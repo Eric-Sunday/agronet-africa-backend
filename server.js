@@ -14,7 +14,8 @@ const rateLimit    = require('express-rate-limit');
 const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
 const { pool, shutdown } = require('./db');
-const { verifyToken }    = require('./middleware/auth');
+const { verifyToken, requireRole } = require('./middleware/auth');
+const agrilencerRouter = require('./routes/agrilencer');
 
 // ── Process-level safety nets ─────────────────────────────────────────────────
 // Prevent unhandled async rejections from crashing the server process
@@ -132,12 +133,17 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor(process.uptime()),
     endpoints: {
-      health:        'GET  /',
-      register:      'POST /api/users',
-      login:         'POST /api/auth/login',
-      profile:       'GET  /api/users/profile',
-      dispatch:      'POST /api/dispatch',
-      jobs:          'GET  /api/jobs?page=1&limit=20&status=active',
+      health:          'GET  /',
+      register:        'POST /api/users',
+      login:           'POST /api/auth/login',
+      profile:         'GET  /api/users/profile',
+      dispatch:        'POST /api/dispatch',
+      jobs:            'GET  /api/jobs?page=1&limit=20&status=active',
+      experts:         'GET  /api/agrilencer/experts',
+      expertDetail:    'GET  /api/agrilencer/experts/:id',
+      specialties:     'GET  /api/agrilencer/experts/specialties',
+      bookings:        'POST /api/agrilencer/bookings',
+      bookingStatus:   'PATCH /api/agrilencer/bookings/:id/status',
     },
   });
 });
@@ -157,12 +163,16 @@ app.post(
   '/api/users',
   strictLimiter,
   asyncHandler(async (req, res) => {
-    const { name, email, password, phone, role = 'farmer', location } = req.body;
+    const {
+      // Shared
+      email, password, role,
+      // Job Seeker fields
+      name, location, specialty, skills,
+      // Employer fields
+      company_name, company_location, tax_id, industry, website,
+    } = req.body;
 
-    // ── Input Validation ──────────────────────────────────────────────────
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      return validationError(res, '"name" is required and must be a non-empty string.');
-    }
+    // ── Shared validation ─────────────────────────────────────────────────
     if (!email || typeof email !== 'string') {
       return validationError(res, '"email" is required.');
     }
@@ -173,12 +183,37 @@ app.post(
       return validationError(res, '"password" is required and must be at least 6 characters.');
     }
 
-    const VALID_ROLES = ['farmer', 'agent', 'admin'];
-    if (!VALID_ROLES.includes(role)) {
-      return validationError(
-        res,
-        `"role" must be one of: ${VALID_ROLES.join(', ')}.`
-      );
+    const VALID_ROLES = ['job_seeker', 'employer'];
+    if (!role || !VALID_ROLES.includes(role)) {
+      return validationError(res, `"role" must be one of: ${VALID_ROLES.join(', ')}.`);
+    }
+
+    // ── Role-specific validation ──────────────────────────────────────────
+    if (role === 'job_seeker') {
+      if (!name || typeof name !== 'string' || !name.trim()) {
+        return validationError(res, '"name" (full name) is required for job seekers.');
+      }
+      if (!location || !location.trim()) {
+        return validationError(res, '"location" is required for job seekers.');
+      }
+      if (!specialty || !specialty.trim()) {
+        return validationError(res, '"specialty" (primary agricultural specialty) is required for job seekers.');
+      }
+      if (!Array.isArray(skills) || skills.length === 0) {
+        return validationError(res, '"skills" must be a non-empty array of skill tags.');
+      }
+    }
+
+    if (role === 'employer') {
+      if (!company_name || typeof company_name !== 'string' || !company_name.trim()) {
+        return validationError(res, '"company_name" is required for employers.');
+      }
+      if (!company_location || !company_location.trim()) {
+        return validationError(res, '"company_location" is required for employers.');
+      }
+      if (!industry || !industry.trim()) {
+        return validationError(res, '"industry" (industry sector) is required for employers.');
+      }
     }
 
     // ── Duplicate check ───────────────────────────────────────────────────
@@ -198,22 +233,66 @@ app.post(
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // ── Insert ────────────────────────────────────────────────────────────
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, phone, role, location)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, name, email, phone, role, location, is_verified, created_at`,
-      [
-        name.trim(),
-        email.toLowerCase().trim(),
-        passwordHash,
-        phone  ? phone.trim()    : null,
-        role,
-        location ? location.trim() : null,
-      ]
-    );
+    // ── Atomic insert: users row + role-specific profile row ──────────────
+    // Using a DB transaction so a partial failure never leaves an orphaned user.
+    const client = await pool.connect();
+    let user;
+    try {
+      await client.query('BEGIN');
 
-    const user = result.rows[0];
+      // 1. Insert base user
+      const userResult = await client.query(
+        `INSERT INTO users (email, password_hash, role)
+         VALUES ($1, $2, $3)
+         RETURNING id, email, role, is_verified, created_at`,
+        [email.toLowerCase().trim(), passwordHash, role]
+      );
+      user = userResult.rows[0];
+
+      // 2. Insert role-specific profile
+      if (role === 'job_seeker') {
+        await client.query(
+          `INSERT INTO job_seeker_profiles (user_id, full_name, location, specialty, skills)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            user.id,
+            name.trim(),
+            location.trim(),
+            specialty.trim(),
+            skills.map(s => String(s).trim()).filter(Boolean),
+          ]
+        );
+        // Attach profile fields to the returned user object
+        user.name     = name.trim();
+        user.location = location.trim();
+        user.specialty = specialty.trim();
+        user.skills   = skills;
+      } else if (role === 'employer') {
+        await client.query(
+          `INSERT INTO employer_profiles (user_id, company_name, company_location, tax_id, industry, website)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            user.id,
+            company_name.trim(),
+            company_location.trim(),
+            tax_id ? tax_id.trim() : null,
+            industry.trim(),
+            website ? website.trim() : null,
+          ]
+        );
+        // Attach profile fields to the returned user object
+        user.company_name     = company_name.trim();
+        user.company_location = company_location.trim();
+        user.industry         = industry.trim();
+      }
+
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;  // re-throw for the global error handler
+    } finally {
+      client.release();
+    }
 
     // ── Generate JWT ──────────────────────────────────────────────────────
     const token = jwt.sign(
@@ -226,7 +305,7 @@ app.post(
       success: true,
       message: 'User registered successfully.',
       token,
-      user
+      user,
     });
   })
 );
@@ -301,39 +380,43 @@ app.post(
 );
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: GET /api/users/profile — Fetch Current Authenticated User Profile
+// ROUTE: GET /api/users/profile — Authenticated Profile (with extended data)
 // ═════════════════════════════════════════════════════════════════════════════
-/**
- * Fetches the currently logged-in user's profile using their JWT.
- * Powers the custom user dashboard on the frontend.
- *
- * Headers: { Authorization: 'Bearer <token>' }
- */
 app.get(
   '/api/users/profile',
   verifyToken,
   asyncHandler(async (req, res) => {
-    // req.user is populated by verifyToken middleware
-    const { id } = req.user;
+    const { id, role } = req.user;
 
-    const result = await pool.query(
-      `SELECT id, name, email, phone, role, location, is_verified, created_at
-       FROM users
-       WHERE id = $1`,
+    // Fetch base user row
+    const userResult = await pool.query(
+      'SELECT id, email, role, is_verified, created_at FROM users WHERE id = $1',
       [id]
     );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Not Found', message: 'User not found.' });
+    }
+    const user = userResult.rows[0];
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not Found',
-        message: 'User profile not found.',
-      });
+    // Fetch role-specific extended profile
+    let profile = {};
+    if (role === 'job_seeker') {
+      const r = await pool.query(
+        'SELECT full_name, location, specialty, skills, bio, phone FROM job_seeker_profiles WHERE user_id = $1',
+        [id]
+      );
+      profile = r.rows[0] || {};
+    } else if (role === 'employer') {
+      const r = await pool.query(
+        'SELECT company_name, company_location, tax_id, industry, website, phone FROM employer_profiles WHERE user_id = $1',
+        [id]
+      );
+      profile = r.rows[0] || {};
     }
 
     return res.status(200).json({
       success: true,
-      user: result.rows[0],
+      user: { ...user, ...profile },
     });
   })
 );
@@ -470,18 +553,18 @@ app.get(
 );
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: GET /api/jobs — Fetch Active Jobs (Paginated)
+// ROUTE: GET /api/jobs — Fetch Active Jobs (Paginated, public)
 // ═════════════════════════════════════════════════════════════════════════════
 app.get(
   '/api/jobs',
   asyncHandler(async (req, res) => {
-    const rawPage     = parseInt(req.query.page,  10);
-    const rawLimit    = parseInt(req.query.limit, 10);
-    const status      = req.query.status   || 'active';
-    const locationKw  = req.query.location || null;
+    const rawPage    = parseInt(req.query.page,  10);
+    const rawLimit   = parseInt(req.query.limit, 10);
+    const status     = req.query.status   || 'active';
+    const locationKw = req.query.location || null;
 
-    const page  = Number.isFinite(rawPage)  && rawPage  > 0 ? rawPage  : 1;
-    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
+    const page   = Number.isFinite(rawPage)  && rawPage  > 0 ? rawPage  : 1;
+    const limit  = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
     const offset = (page - 1) * limit;
 
     const VALID_STATUS = ['active', 'filled', 'closed', 'draft'];
@@ -489,28 +572,29 @@ app.get(
       return validationError(res, `"status" must be one of: ${VALID_STATUS.join(', ')}.`);
     }
 
-    const params  = [status, limit, offset];
+    const params = [status, limit, offset];
     let whereClause = 'WHERE j.status = $1';
-
     if (locationKw) {
       params.push(`%${locationKw.toLowerCase()}%`);
       whereClause += ` AND LOWER(j.location) LIKE $${params.length}`;
     }
 
+    // jobs.employer_id + employer_profiles for company_name
     const jobsQuery = `
       SELECT
-        j.id, j.title, j.description, j.location, j.status, j.created_at,
-        u.id   AS farmer_id,
-        u.name AS farmer_name
+        j.id, j.title, j.description, j.location, j.industry, j.salary_range,
+        j.status, j.created_at,
+        j.employer_id,
+        ep.company_name AS employer_name
       FROM jobs j
-      LEFT JOIN users u ON u.id = j.farmer_id
+      LEFT JOIN employer_profiles ep ON ep.user_id = j.employer_id
       ${whereClause}
       ORDER BY j.created_at DESC
       LIMIT $2 OFFSET $3
     `;
 
-    const countParams  = [status];
-    let countWhere     = 'WHERE status = $1';
+    const countParams = [status];
+    let countWhere = 'WHERE status = $1';
     if (locationKw) {
       countParams.push(`%${locationKw.toLowerCase()}%`);
       countWhere += ` AND LOWER(location) LIKE $${countParams.length}`;
@@ -528,14 +612,164 @@ app.get(
     return res.status(200).json({
       success: true,
       data: jobsResult.rows,
-      pagination: {
-        page, limit, total, total_pages: totalPages,
-        has_next:    page < totalPages,
-        has_prev:    page > 1,
-      },
+      pagination: { page, limit, total, total_pages: totalPages,
+        has_next: page < totalPages, has_prev: page > 1 },
     });
   })
 );
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/jobs — Create Job (employer only)
+// ═════════════════════════════════════════════════════════════════════════════
+app.post(
+  '/api/jobs',
+  strictLimiter,
+  verifyToken,
+  requireRole(['employer']),
+  asyncHandler(async (req, res) => {
+    const { title, description, location, industry, salary_range } = req.body;
+    if (!title?.trim())       return validationError(res, '"title" is required.');
+    if (!description?.trim()) return validationError(res, '"description" is required.');
+    if (!location?.trim())    return validationError(res, '"location" is required.');
+
+    const result = await pool.query(
+      `INSERT INTO jobs (employer_id, title, description, location, industry, salary_range)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, employer_id, title, description, location, industry, salary_range, status, created_at`,
+      [req.user.id, title.trim(), description.trim(), location.trim(),
+       industry?.trim() || null, salary_range?.trim() || null]
+    );
+    return res.status(201).json({ success: true, data: result.rows[0] });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: PUT /api/jobs/:id — Update Job (employer only, must own the listing)
+// ═════════════════════════════════════════════════════════════════════════════
+app.put(
+  '/api/jobs/:id',
+  verifyToken,
+  requireRole(['employer']),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { title, description, location, industry, salary_range, status } = req.body;
+
+    // Ownership check
+    const job = await pool.query('SELECT employer_id FROM jobs WHERE id = $1', [id]);
+    if (job.rows.length === 0) return res.status(404).json({ success: false, message: 'Job not found.' });
+    if (job.rows[0].employer_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Forbidden',
+        message: 'Access denied. Only registered employers can manage job listings.' });
+    }
+
+    const result = await pool.query(
+      `UPDATE jobs SET
+         title        = COALESCE($1, title),
+         description  = COALESCE($2, description),
+         location     = COALESCE($3, location),
+         industry     = COALESCE($4, industry),
+         salary_range = COALESCE($5, salary_range),
+         status       = COALESCE($6, status)
+       WHERE id = $7
+       RETURNING id, employer_id, title, description, location, industry, salary_range, status, created_at`,
+      [title || null, description || null, location || null,
+       industry || null, salary_range || null, status || null, id]
+    );
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: DELETE /api/jobs/:id — Delete Job (employer only, must own it)
+// ═════════════════════════════════════════════════════════════════════════════
+app.delete(
+  '/api/jobs/:id',
+  verifyToken,
+  requireRole(['employer']),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const job = await pool.query('SELECT employer_id FROM jobs WHERE id = $1', [id]);
+    if (job.rows.length === 0) return res.status(404).json({ success: false, message: 'Job not found.' });
+    if (job.rows[0].employer_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Forbidden',
+        message: 'Access denied. Only registered employers can manage job listings.' });
+    }
+    await pool.query('DELETE FROM jobs WHERE id = $1', [id]);
+    return res.status(200).json({ success: true, message: 'Job deleted successfully.' });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/jobs/:id/apply — Submit Application (job_seeker only)
+// ═════════════════════════════════════════════════════════════════════════════
+app.post(
+  '/api/jobs/:id/apply',
+  strictLimiter,
+  verifyToken,
+  requireRole(['job_seeker']),
+  asyncHandler(async (req, res) => {
+    const jobId = req.params.id;
+    const applicantId = req.user.id;
+    const { cover_note } = req.body;
+
+    // Verify job exists
+    const job = await pool.query('SELECT id FROM jobs WHERE id = $1 AND status = $2', [jobId, 'active']);
+    if (job.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Job not found or no longer active.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO applications (job_id, applicant_id, cover_note)
+       VALUES ($1, $2, $3)
+       RETURNING id, job_id, applicant_id, cover_note, status, created_at`,
+      [jobId, applicantId, cover_note?.trim() || null]
+    );
+    return res.status(201).json({
+      success: true,
+      message: 'Application submitted successfully.',
+      data: result.rows[0],
+    });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: GET /api/jobs/:id/applications — View Applications (employer only, own jobs)
+// ═════════════════════════════════════════════════════════════════════════════
+app.get(
+  '/api/jobs/:id/applications',
+  verifyToken,
+  requireRole(['employer']),
+  asyncHandler(async (req, res) => {
+    const jobId = req.params.id;
+    const job = await pool.query('SELECT employer_id FROM jobs WHERE id = $1', [jobId]);
+    if (job.rows.length === 0) return res.status(404).json({ success: false, message: 'Job not found.' });
+    if (job.rows[0].employer_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Forbidden',
+        message: 'Access denied. Only registered employers can manage job listings.' });
+    }
+    const apps = await pool.query(
+      `SELECT a.id, a.cover_note, a.status, a.created_at,
+              p.full_name, p.specialty, p.location AS applicant_location
+       FROM applications a
+       JOIN job_seeker_profiles p ON p.user_id = a.applicant_id
+       WHERE a.job_id = $1
+       ORDER BY a.created_at DESC`,
+      [jobId]
+    );
+    return res.status(200).json({ success: true, data: apps.rows });
+  })
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AGRILENCER ROUTER — /api/agrilencer/*
+// ═════════════════════════════════════════════════════════════════════════════
+app.use('/api/agrilencer', agrilencerRouter);
+
+// ── Legacy aliases — keep old /api/experts/* URLs working for deployed frontend
+app.get('/api/experts',             (req, res) => res.redirect(307, `/api/agrilencer/experts?${new URLSearchParams(req.query).toString()}`));
+app.get('/api/experts/featured',    (req, res) => res.redirect(307, `/api/agrilencer/experts/featured?${new URLSearchParams(req.query).toString()}`));
+app.get('/api/experts/specialties', (req, res) => res.redirect(307, '/api/agrilencer/experts/specialties'));
+app.get('/api/experts/:id',         (req, res) => res.redirect(307, `/api/agrilencer/experts/${req.params.id}`));
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 404 HANDLER

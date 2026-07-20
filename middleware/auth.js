@@ -1,9 +1,12 @@
+'use strict';
+
 const jwt = require('jsonwebtoken');
 
-/**
- * Middleware to verify JWT tokens and protect routes.
- * Expects the token in the Authorization header as: Bearer <token>
- */
+const JWT_SECRET = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// verifyToken — validate JWT and attach decoded payload to req.user
+// ─────────────────────────────────────────────────────────────────────────────
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -18,14 +21,10 @@ const verifyToken = (req, res, next) => {
   const token = authHeader.split(' ')[1];
 
   try {
-    // Note: ensure JWT_SECRET is set in your .env
-    const secret = process.env.JWT_SECRET || 'agronet-dev-secret-key-123';
-    const decoded = jwt.verify(token, secret);
-    
-    // Attach the decoded user payload to the request object
-    req.user = decoded;
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // { id, email, role }
     next();
-  } catch (error) {
+  } catch {
     return res.status(401).json({
       success: false,
       error: 'Unauthorized',
@@ -34,4 +33,38 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-module.exports = { verifyToken };
+// ─────────────────────────────────────────────────────────────────────────────
+// requireRole — RBAC middleware factory
+//
+// Usage:
+//   router.post('/api/jobs', verifyToken, requireRole(['employer']), handler)
+//   router.post('/api/applications', verifyToken, requireRole(['job_seeker']), handler)
+//
+// Returns 403 Forbidden with a descriptive error message when the
+// authenticated user's role is not in the allowedRoles array.
+// ─────────────────────────────────────────────────────────────────────────────
+const requireRole = (allowedRoles) => (req, res, next) => {
+  const role = req.user?.role;
+
+  if (!role || !allowedRoles.includes(role)) {
+    // Build a specific human-readable denial message per context
+    let message;
+    if (allowedRoles.includes('employer') && !allowedRoles.includes('job_seeker')) {
+      message = 'Access denied. Only registered employers can manage job listings.';
+    } else if (allowedRoles.includes('job_seeker') && !allowedRoles.includes('employer')) {
+      message = 'Access denied. Employers cannot apply for jobs.';
+    } else {
+      message = `Access denied. Required role: ${allowedRoles.join(' or ')}.`;
+    }
+
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message,
+    });
+  }
+
+  next();
+};
+
+module.exports = { verifyToken, requireRole };

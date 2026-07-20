@@ -1,62 +1,94 @@
 -- =============================================================================
--- AgroNet Africa — Database Schema Initialization
--- Run this script against your PostgreSQL database to set up all tables.
+-- AgroNet Africa — Database Schema v3.0  (RBAC Edition)
+-- Run this script against your PostgreSQL database to migrate/initialize.
 -- Compatible with: PostgreSQL 14+, Supabase, Neon, Railway, Render PostgreSQL
 -- =============================================================================
 
--- Enable pgcrypto for UUID generation (if available on your host)
+-- Enable pgcrypto for UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- =============================================================================
 -- TABLE: users
--- Stores all registered platform users (farmers, agents, admins)
+-- Stores all registered platform users.
+-- Role is immutable once set (enforced by the CHECK + application layer).
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS users (
-  id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-  name          VARCHAR(150)  NOT NULL,
-  email         VARCHAR(255)  NOT NULL UNIQUE,
-  password_hash VARCHAR(255)  NOT NULL,
-  phone         VARCHAR(30),
-  role          VARCHAR(20)   NOT NULL DEFAULT 'farmer'
-                              CHECK (role IN ('farmer', 'agent', 'admin')),
-  location      TEXT,
-  is_verified   BOOLEAN       NOT NULL DEFAULT FALSE,
-  created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  email           VARCHAR(255)  NOT NULL UNIQUE,
+  password_hash   VARCHAR(255)  NOT NULL,
+  role            VARCHAR(20)   NOT NULL
+                                CHECK (role IN ('job_seeker', 'employer')),
+  is_verified     BOOLEAN       NOT NULL DEFAULT FALSE,
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
--- Index for fast email lookups (login, duplicate checks)
-CREATE INDEX IF NOT EXISTS idx_users_email     ON users (email);
--- Index for role-based filtering (admin dashboards, agent queries)
-CREATE INDEX IF NOT EXISTS idx_users_role      ON users (role);
--- Index for location-based queries (regional dispatch, analytics)
-CREATE INDEX IF NOT EXISTS idx_users_location  ON users (location);
+-- =============================================================================
+-- TABLE: job_seeker_profiles
+-- Extended profile for users with role = 'job_seeker'
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS job_seeker_profiles (
+  user_id         UUID          PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  full_name       VARCHAR(150)  NOT NULL,
+  location        TEXT,
+  specialty       VARCHAR(150),   -- e.g. "Crop Science", "Agronomy"
+  skills          TEXT[],         -- array of skill tags
+  bio             TEXT,
+  phone           VARCHAR(30),
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================================
+-- TABLE: employer_profiles
+-- Extended profile for users with role = 'employer'
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS employer_profiles (
+  user_id         UUID          PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  company_name    VARCHAR(200)  NOT NULL,
+  tax_id          VARCHAR(100),   -- optional registration/tax ID
+  company_location TEXT,
+  industry        VARCHAR(100),   -- e.g. "Crop Production", "Aquaculture"
+  website         VARCHAR(300),
+  phone           VARCHAR(30),
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
 
 -- =============================================================================
 -- TABLE: jobs
--- Long-term agricultural roles posted by farmers or agents
+-- Agricultural roles posted exclusively by employers
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS jobs (
-  id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-  farmer_id     UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title         VARCHAR(200)  NOT NULL,
-  description   TEXT          NOT NULL,
-  location      TEXT          NOT NULL,
-  status        VARCHAR(20)   NOT NULL DEFAULT 'active'
-                              CHECK (status IN ('active', 'filled', 'closed', 'draft')),
-  created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  employer_id     UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title           VARCHAR(200)  NOT NULL,
+  description     TEXT          NOT NULL,
+  location        TEXT          NOT NULL,
+  industry        VARCHAR(100),
+  salary_range    VARCHAR(100),
+  status          VARCHAR(20)   NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active', 'filled', 'closed', 'draft')),
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
--- Index for fetching jobs by farmer (user dashboard)
-CREATE INDEX IF NOT EXISTS idx_jobs_farmer_id  ON jobs (farmer_id);
--- Index for filtering active jobs (public feed with pagination)
-CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs (status);
--- Composite index for paginated active-jobs feed (status + created_at DESC)
-CREATE INDEX IF NOT EXISTS idx_jobs_active_feed ON jobs (status, created_at DESC);
+-- =============================================================================
+-- TABLE: applications
+-- Job applications submitted exclusively by job_seekers
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS applications (
+  id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  job_id          UUID          NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  applicant_id    UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  cover_note      TEXT,
+  status          VARCHAR(20)   NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'reviewed', 'shortlisted', 'rejected', 'hired')),
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  UNIQUE (job_id, applicant_id)  -- prevent duplicate applications
+);
 
 -- =============================================================================
 -- TABLE: dispatches
--- Stores emergency triage records for the Core AI Innovation / Contextual Dispatch module.
--- Natural language distress strings, GPS coordinates, AI classification, escrow status.
+-- Emergency triage records for the Contextual Dispatch AI module
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS dispatches (
   id                UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -75,15 +107,72 @@ CREATE TABLE IF NOT EXISTS dispatches (
   created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
--- Index for per-farmer dispatch history
-CREATE INDEX IF NOT EXISTS idx_dispatches_farmer_id       ON dispatches (farmer_id);
--- Index for filtering by AI classification (analytics, team routing)
-CREATE INDEX IF NOT EXISTS idx_dispatches_classification  ON dispatches (ai_classification);
--- Index for open/in-progress response queue
-CREATE INDEX IF NOT EXISTS idx_dispatches_response_status ON dispatches (response_status);
--- Index for escrow management queries
-CREATE INDEX IF NOT EXISTS idx_dispatches_escrow_status   ON dispatches (escrow_status);
+-- =============================================================================
+-- INDEXES
+-- =============================================================================
+CREATE INDEX IF NOT EXISTS idx_users_email            ON users (email);
+CREATE INDEX IF NOT EXISTS idx_users_role             ON users (role);
+CREATE INDEX IF NOT EXISTS idx_jobs_employer_id       ON jobs (employer_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs (status);
+CREATE INDEX IF NOT EXISTS idx_jobs_active_feed       ON jobs (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_applications_job_id    ON applications (job_id);
+CREATE INDEX IF NOT EXISTS idx_applications_applicant ON applications (applicant_id);
+CREATE INDEX IF NOT EXISTS idx_dispatches_farmer_id   ON dispatches (farmer_id);
 
 -- =============================================================================
--- END OF SCHEMA
+-- TABLE: expert_profiles
+-- On-demand agricultural expert marketplace — Agrilencer feature
+-- Each row corresponds to a user who has registered as an expert.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS expert_profiles (
+  id                  UUID          PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  hourly_rate         NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+  currency            VARCHAR(10)   NOT NULL DEFAULT 'NGN',
+  specialty           VARCHAR(100)  NOT NULL,  -- e.g. 'Agronomist', 'Pathologist'
+  years_experience    INT           NOT NULL DEFAULT 0,
+  location_state      VARCHAR(100)  NOT NULL,
+  geo_latitude        NUMERIC(10,8),
+  geo_longitude       NUMERIC(11,8),
+  verification_status VARCHAR(20)   NOT NULL DEFAULT 'pending'
+                                    CHECK (verification_status IN ('pending', 'verified', 'rejected')),
+  rating              NUMERIC(3,2)  NOT NULL DEFAULT 5.00
+                                    CHECK (rating >= 0.00 AND rating <= 5.00),
+  bio                 TEXT,
+  created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================================
+-- TABLE: consultation_bookings
+-- Escrow-backed consultation records between a client and an expert.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS consultation_bookings (
+  id               UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id        UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expert_id        UUID          NOT NULL REFERENCES expert_profiles(id) ON DELETE CASCADE,
+  farm_issue_title VARCHAR(255)  NOT NULL,
+  description      TEXT          NOT NULL,
+  urgency_level    VARCHAR(30)   NOT NULL DEFAULT 'medium'
+                                 CHECK (urgency_level IN ('low', 'medium', 'critical_crisis')),
+  escrow_amount    NUMERIC(10,2) NOT NULL,
+  escrow_status    VARCHAR(30)   NOT NULL DEFAULT 'held_in_escrow'
+                                 CHECK (escrow_status IN ('pending_payment', 'held_in_escrow', 'disbursed', 'refunded')),
+  booking_status   VARCHAR(30)   NOT NULL DEFAULT 'requested'
+                                 CHECK (booking_status IN ('requested', 'accepted', 'completed', 'cancelled')),
+  created_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================================
+-- INDEXES — Agrilencer
+-- =============================================================================
+CREATE INDEX IF NOT EXISTS idx_expert_specialty         ON expert_profiles (specialty);
+CREATE INDEX IF NOT EXISTS idx_expert_location          ON expert_profiles (location_state);
+CREATE INDEX IF NOT EXISTS idx_expert_verification      ON expert_profiles (verification_status);
+CREATE INDEX IF NOT EXISTS idx_expert_rating            ON expert_profiles (rating DESC);
+CREATE INDEX IF NOT EXISTS idx_bookings_client          ON consultation_bookings (client_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_expert          ON consultation_bookings (expert_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_status          ON consultation_bookings (booking_status);
+
+-- =============================================================================
+-- END OF SCHEMA v4.0
 -- =============================================================================
