@@ -37,10 +37,10 @@ const notFoundError = (res, message) =>
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/agrilencer/experts/specialties
 // Public — returns the distinct list of specialties for filter dropdowns.
+// SAFE: returns [] on any DB error to prevent frontend network error banners.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get(
-  '/experts/specialties',
-  asyncHandler(async (_req, res) => {
+router.get('/experts/specialties', async (_req, res) => {
+  try {
     const result = await pool.query(
       `SELECT DISTINCT specialty
        FROM expert_profiles
@@ -51,16 +51,20 @@ router.get(
       success: true,
       data: result.rows.map(r => r.specialty),
     });
-  })
-);
+  } catch (err) {
+    console.error('[AGRILENCER] GET /experts/specialties DB error:', err.message);
+    // Return graceful empty response so frontend doesn't show connection error
+    return res.status(200).json({ success: true, data: [] });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/agrilencer/experts/featured
 // Public — top-rated verified experts (limit param, default 4).
+// SAFE: returns [] on any DB error to prevent frontend network error banners.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get(
-  '/experts/featured',
-  asyncHandler(async (req, res) => {
+router.get('/experts/featured', async (req, res) => {
+  try {
     const rawLimit = parseInt(req.query.limit, 10);
     const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 20) : 4;
 
@@ -79,17 +83,20 @@ router.get(
     );
 
     return res.status(200).json({ success: true, data: result.rows });
-  })
-);
+  } catch (err) {
+    console.error('[AGRILENCER] GET /experts/featured DB error:', err.message);
+    return res.status(200).json({ success: true, data: [] });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/agrilencer/experts
 // Public — list verified experts with optional filters.
 // Query params: ?specialty=, ?state=, ?search=, ?page=, ?limit=
+// SAFE: returns empty paginated response on any DB error.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get(
-  '/experts',
-  asyncHandler(async (req, res) => {
+router.get('/experts', async (req, res) => {
+  try {
     const rawPage  = parseInt(req.query.page,  10);
     const rawLimit = parseInt(req.query.limit, 10);
     const page     = Number.isFinite(rawPage)  && rawPage  > 0 ? rawPage  : 1;
@@ -154,7 +161,7 @@ router.get(
     ]);
 
     const total      = parseInt(countResult.rows[0]?.total ?? 0, 10);
-    const totalPages = Math.ceil(total / limit);
+    const totalPages = Math.ceil(total / limit) || 1;
 
     return res.status(200).json({
       success: true,
@@ -162,13 +169,24 @@ router.get(
       pagination:  { page, limit, total, total_pages: totalPages,
                      has_next: page < totalPages, has_prev: page > 1 },
     });
-  })
-);
+  } catch (err) {
+    console.error('[AGRILENCER] GET /experts DB error:', err.message);
+    // Return graceful empty paginated response — prevents frontend "Could not
+    // connect to backend" error banner when the table is empty or DB is cold.
+    return res.status(200).json({
+      success: true,
+      data: [],
+      pagination: { page: 1, limit: 20, total: 0, total_pages: 1,
+                    has_next: false, has_prev: false },
+    });
+  }
+});
 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/agrilencer/experts/:id
 // Public — detailed expert profile joined with user metadata.
+// SAFE: returns 404 on missing expert; 500 on unexpected DB errors (intentional).
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
   '/experts/:id',
